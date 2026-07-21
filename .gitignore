@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.DS_Store
+*.swp
+*.swo
+*~
+test_outputs/
+test_node.py
+preview.html
+.claude/

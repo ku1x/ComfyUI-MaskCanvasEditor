@@ -89,10 +89,31 @@ No extra dependencies — just restart ComfyUI.
 
 ### Example Workflow
 
-```
-LoadImage ──┐
-             ├── MaskCanvasEditor ──► PreviewImage
-LoadMask  ──┘
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 30, 'rankSpacing': 25}}}%%
+flowchart LR
+    subgraph Input["📥 Input"]
+        direction TB
+        M["LoadImage\n(mask channel)"]
+        I["LoadImage"]
+        S["SAM / RMBG /\nMaskEditor"]
+    end
+
+    subgraph Editor["🎨 Mask Canvas Editor"]
+        N["MaskCanvasEditor\nscale / rotate / flip / offset"]
+    end
+
+    subgraph Output["📤 Output"]
+        P["PreviewImage"]
+        K["KSampler +\nother nodes"]
+    end
+
+    M -->|"mask"| N
+    I -->|"image"| N
+    S -->|"mask"| N
+    N -->|"cropped_image"| P
+    N -->|"cropped_mask"| P
+    N -->|"cropped_image"| K
 ```
 
 ---

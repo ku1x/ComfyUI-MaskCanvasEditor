@@ -27,10 +27,12 @@ Think of it as cropping an image to a mask, but controlled entirely through visu
 - 🎨 **Node IS the Editor** — No slider widgets, no popup modals. The node body itself is the interactive canvas
 - 🖼️ **Mask as Window** — The mask stays centered; the background image moves behind it
 - 🔄 **Full Transform Control** — Scale (0.01×–10×), rotation (±180°), horizontal/vertical flip, pixel-precise offset
-- 🖱️ **Direct Manipulation** — Drag to pan, scroll to zoom, Shift+scroll to rotate, buttons to flip
+- 🖱️ **Direct Manipulation** — Drag to pan, scroll to zoom, Shift+scroll to rotate, click toolbar buttons to flip/reset
 - 🎯 **Grid Overlay** — Checkerboard pattern with center crosshair shows the background image bounds and transforms
-- 📦 **Zero Dependencies** — Works with ComfyUI's built-in torch; no extra packages required
+- 📦 **Zero Dependencies** — Works with ComfyUI's built-in PyTorch; no extra packages required
 - 🌐 **Bilingual** — Supports both English and Chinese workflows
+
+> **⚠️ Tip:** Resize the node by dragging its bottom-right corner to give yourself more canvas space!
 
 ---
 
@@ -233,7 +235,7 @@ git clone https://github.com/ku1x/ComfyUI-MaskCanvasEditor.git
 | `mask` | MASK | 定义裁剪窗口的遮罩 |
 | `image` | IMAGE | 需要定位的背景图片 |
 
-所有变换参数（缩放、旋转、翻转、偏移）完全通过节点体上的**可视化交互**控制。 |
+所有变换参数（缩放、旋转、翻转、偏移）完全通过节点体上的**可视化交互**控制。
 
 ### 节点输出
 

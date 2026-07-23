@@ -5,6 +5,9 @@
  * No slider widgets, no modal popups — everything happens
  * directly on the node via mouse interaction.
  *
+ * The actual input image is loaded from ComfyUI temp storage
+ * and drawn as the canvas background with transforms applied.
+ *
  * Drag to pan, scroll to zoom, shift+scroll to rotate.
  * Flip buttons and reset are drawn in a toolbar at the bottom.
  * Transform state is persisted through a hidden bridge widget.
@@ -24,25 +27,17 @@ const DEFAULT_STATE = {
 };
 
 // ── Global wheel listener ──────────────────────────────────
-// ComfyUI/LiteGraph doesn't consistently support onMouseWheel
-// on node prototypes. We use a single global wheel listener
-// on the canvas DOM element that checks all our nodes.
 function setupWheelListener() {
   if (!app.canvasEl || window._mceWheelInited) return;
   window._mceWheelInited = true;
 
   app.canvasEl.addEventListener("wheel", (e) => {
-    // Don't intercept if the user is zooming the graph (Ctrl+Wheel)
-    // or if no graph exists
     if (e.ctrlKey || e.metaKey) return;
     if (!app.graph) return;
 
-    // Graph mouse position (in node-space coordinates)
-    // Note: app.canvas.graph_mouse may be undefined in some versions
     const gm = app.canvas.graph_mouse;
     if (!gm) return;
 
-    // Check all our nodes top-down (last drawn = highest z-index ≈ last in array)
     const nodes = app.graph._nodes || [];
     for (let i = nodes.length - 1; i >= 0; i--) {
       const n = nodes[i];
@@ -55,7 +50,6 @@ function setupWheelListener() {
 
       if (gm[0] >= nx && gm[0] <= nx + nw &&
           gm[1] >= ny && gm[1] <= ny + nh) {
-        // Check toolbar area — ignore wheel there
         if (gm[1] >= ny + nh - 32) break;
 
         e.preventDefault();
@@ -69,12 +63,10 @@ function setupWheelListener() {
           n._state.scale = Math.round(n._state.scale * 100) / 100;
         }
 
-        // Sync to hidden widget
         const sw = n.widgets?.find((w) => w.name === "transform_state");
         if (sw) sw.value = JSON.stringify(n._state);
         if (n.graph) n.graph._version = (n.graph._version || 0) + 1;
 
-        // Force redraw of this node
         n.setDirtyCanvas(true, true);
         return;
       }
@@ -101,8 +93,13 @@ app.registerExtension({
     node._dragStart = [0, 0];
     node._dragStateStart = [0, 0];
 
+    // Preview image loaded from ComfyUI temp storage
+    node._previewImage = null;
+    node._previewUrl = "";
+    node._imgNaturalW = 0;
+    node._imgNaturalH = 0;
+
     // ── Hidden bridge widget for serialization ─────────────
-    // "transform_state" matches the Python hidden input name
     const stateWidget = node.addWidget("text", "transform_state", "{}", () => {}, {});
     stateWidget.hidden = true;
     stateWidget.serializeValue = function () {
@@ -111,7 +108,6 @@ app.registerExtension({
     stateWidget.computeSize = () => [0, 0];
     stateWidget.draw = () => {};
 
-    // Load saved state from workflow JSON
     const savedSerialized = stateWidget.value;
     if (savedSerialized && savedSerialized !== "{}") {
       try {
@@ -121,7 +117,7 @@ app.registerExtension({
     }
 
     // ── Set initial node size ─────────────────────────────
-    node.size = [360, 400];
+    node.size = [360, 420];
     node.minSize = [300, 320];
 
     const TOOLBAR_H = 32;
@@ -133,6 +129,32 @@ app.registerExtension({
         node.graph._version = (node.graph._version || 0) + 1;
       }
     }
+
+    // ── Handle execution result ────────────────────────────
+    // The Python backend sends back the preview image filename
+    node.onExecuted = function (message) {
+      const preview = message?.mce_preview?.[0];
+      if (!preview) return;
+
+      // Build URL with cache-busting
+      const url = `/view?filename=${preview.filename}&subfolder=${preview.subfolder || ""}&type=${preview.type || "temp"}&t=${Date.now()}`;
+
+      if (url === this._previewUrl) return; // same image, skip
+
+      this._previewUrl = url;
+
+      const img = new Image();
+      img.onload = () => {
+        this._previewImage = img;
+        this._imgNaturalW = img.naturalWidth;
+        this._imgNaturalH = img.naturalHeight;
+        this.setDirtyCanvas(true, true);
+      };
+      img.onerror = () => {
+        // Silently keep the grid
+      };
+      img.src = url;
+    };
 
     // ── Drawing ─────────────────────────────────────────────
     node.onDrawForeground = function (ctx) {
@@ -171,7 +193,9 @@ app.registerExtension({
         return;
       }
 
-      // ── Compute mask window (proportional to node) ──
+      const hasPreview = this._previewImage && this._imgNaturalW > 0;
+
+      // ── Compute mask window ──
       const mw = Math.min(W * 0.5, canvasH * 0.5, 200);
       const mh = mw;
       const mx = cx - mw / 2;
@@ -179,7 +203,7 @@ app.registerExtension({
 
       this._canvasMaskRect = { x: mx, y: my, w: mw, h: mh };
 
-      // ── Draw the transformed grid (background image) ──
+      // ── Draw the transformed background ──
       ctx.save();
       ctx.translate(cx, cy);
       ctx.scale(s.scale, s.scale);
@@ -187,16 +211,42 @@ app.registerExtension({
       if (s.flipH) ctx.scale(-1, 1);
       if (s.flipV) ctx.scale(1, -1);
       ctx.translate(s.offsetX, s.offsetY);
-      this._drawGrid(ctx, W, canvasH);
+
+      if (hasPreview) {
+        // Draw the actual image centered at the image origin
+        // The image draws at its natural size in "image space";
+        // transforms (scale, rotate, flip, offset) then determine
+        // what portion is visible through the mask window.
+        ctx.drawImage(
+          this._previewImage,
+          -this._imgNaturalW / 2,
+          -this._imgNaturalH / 2,
+          this._imgNaturalW,
+          this._imgNaturalH,
+        );
+
+        // Subtle edge highlight so you can see image bounds
+        ctx.strokeStyle = "rgba(203, 166, 247, 0.25)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(
+          -this._imgNaturalW / 2,
+          -this._imgNaturalH / 2,
+          this._imgNaturalW,
+          this._imgNaturalH,
+        );
+      } else {
+        // Fallback: draw the grid when no preview has loaded yet
+        this._drawGrid(ctx, W, canvasH);
+      }
+
       ctx.restore();
 
       // ── Draw mask overlay ──
-      // Semi-transparent dark overlay outside mask
       ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
-      ctx.fillRect(0, 0, W, my);                         // top
-      ctx.fillRect(0, my + mh, W, canvasH - (my + mh)); // bottom
-      ctx.fillRect(0, my, mx, mh);                       // left
-      ctx.fillRect(mx + mw, my, W - (mx + mw), mh);     // right
+      ctx.fillRect(0, 0, W, my);
+      ctx.fillRect(0, my + mh, W, canvasH - (my + mh));
+      ctx.fillRect(0, my, mx, mh);
+      ctx.fillRect(mx + mw, my, W - (mx + mw), mh);
 
       // Mask border (dashed)
       ctx.strokeStyle = "#89b4fa";
@@ -209,22 +259,17 @@ app.registerExtension({
       ctx.strokeStyle = "#cba6f7";
       ctx.lineWidth = 3;
       const cl = 16;
-      const c = (x1, y1, x2, y2) => {
+      const corner = (x, y, dx1, dy1, dx2, dy2) => {
         ctx.beginPath();
-        ctx.moveTo(x1[0], x1[1]);
-        ctx.lineTo(x1[0] + x2[0], x1[1] + x2[1]);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(x1[0], x1[1]);
-        ctx.lineTo(x1[0] + y2[0], x1[1] + y2[1]);
+        ctx.moveTo(x + dx1, y + dy1); ctx.lineTo(x, y); ctx.lineTo(x + dx2, y + dy2);
         ctx.stroke();
       };
-      c([mx, my], [cl, 0], [0, cl]);
-      c([mx + mw, my], [-cl, 0], [0, cl]);
-      c([mx, my + mh], [cl, 0], [0, -cl]);
-      c([mx + mw, my + mh], [-cl, 0], [0, -cl]);
+      corner(mx, my, cl, 0, 0, cl);
+      corner(mx + mw, my, -cl, 0, 0, cl);
+      corner(mx, my + mh, cl, 0, 0, -cl);
+      corner(mx + mw, my + mh, -cl, 0, 0, -cl);
 
-      // Crosshair
+      // Crosshair inside mask
       ctx.strokeStyle = "rgba(203, 166, 247, 0.35)";
       ctx.lineWidth = 1;
       ctx.setLineDash([2, 4]);
@@ -240,6 +285,7 @@ app.registerExtension({
       ctx.textAlign = "left";
       ctx.fillText(
         `${Math.round(mw)}×${Math.round(mh)}  ` +
+        (hasPreview ? `${this._imgNaturalW}×${this._imgNaturalH}  ` : "") +
         `S:${s.scale.toFixed(2)}  R:${s.rotation.toFixed(0)}°` +
         (s.flipH ? "  H" : "") + (s.flipV ? "  V" : ""),
         mx + 4, my + mh + 14
@@ -291,7 +337,6 @@ app.registerExtension({
         "flipV");
       drawBtn(50, "↺ R", "#45475a", "#cdd6f4", "reset");
 
-      // Transform info on the right
       ctx.textAlign = "right";
       ctx.fillStyle = "#6c7086";
       ctx.font = "10px -apple-system, sans-serif";
@@ -305,7 +350,7 @@ app.registerExtension({
       ctx.textBaseline = "alphabetic";
     };
 
-    // ── Grid ────────────────────────────────────────────────
+    // ── Grid (fallback when no preview loaded) ──────────────
     node._drawGrid = function (ctx, W, H) {
       const ext = Math.max(W, H) * 2;
       const step = 64;
@@ -323,11 +368,10 @@ app.registerExtension({
       ctx.strokeStyle = "rgba(137, 180, 250, 0.12)";
       ctx.lineWidth = 1;
       ctx.beginPath();
-      for (let x = s; x <= e; x += step) ctx.moveTo(x, s), ctx.lineTo(x, e);
-      for (let y = s; y <= e; y += step) ctx.moveTo(s, y), ctx.lineTo(e, y);
+      for (let x = s; x <= e; x += step) { ctx.moveTo(x, s); ctx.lineTo(x, e); }
+      for (let y = s; y <= e; y += step) { ctx.moveTo(s, y); ctx.lineTo(e, y); }
       ctx.stroke();
 
-      // Center crosshair
       ctx.strokeStyle = "rgba(137, 180, 250, 0.45)";
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -338,6 +382,12 @@ app.registerExtension({
       ctx.fillStyle = "#89b4fa";
       ctx.beginPath(); ctx.arc(0, 0, 3, 0, Math.PI * 2);
       ctx.fill();
+
+      ctx.fillStyle = "#89b4fa";
+      ctx.font = "10px -apple-system, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Waiting for execution...", 0, -16);
+      ctx.textAlign = "start";
     };
 
     // ── Mouse down ──────────────────────────────────────────
@@ -345,7 +395,6 @@ app.registerExtension({
       const H = this.size[1];
       const canvasH = H - TOOLBAR_H;
 
-      // Canvas area → start drag
       if (pos[1] >= 0 && pos[1] < canvasH) {
         this._dragging = true;
         this._dragStart = [pos[0], pos[1]];
@@ -353,7 +402,6 @@ app.registerExtension({
         return true;
       }
 
-      // Toolbar buttons
       if (pos[1] >= canvasH && this._toolbarBtns) {
         for (const btn of this._toolbarBtns) {
           if (pos[0] >= btn.x && pos[0] <= btn.x + btn.w &&
@@ -398,6 +446,8 @@ app.registerExtension({
     // ── Cleanup ─────────────────────────────────────────────
     const origOnRemoved = node.onRemoved;
     node.onRemoved = function () {
+      this._previewImage = null;
+      this._previewUrl = "";
       if (origOnRemoved) {
         origOnRemoved.apply(this, arguments);
       }

@@ -4,12 +4,19 @@ A fully graphical ComfyUI node — the node body itself is an interactive canvas
 Position a background image behind a mask region with direct visual manipulation:
 drag to pan, scroll to zoom, shift+scroll to rotate, buttons to flip.
 No parameter sliders needed — everything is controlled through the canvas.
+
+The input image is saved as a preview so the frontend canvas shows the actual
+image as the background rather than a placeholder grid.
 """
 
 import torch
 import torch.nn.functional as F
 import math
 import json
+import os
+import numpy as np
+from PIL import Image
+import folder_paths
 
 
 class MaskCanvasEditor:
@@ -29,6 +36,7 @@ class MaskCanvasEditor:
                 "image": ("IMAGE",),
             },
             "hidden": {
+                "unique_id": "UNIQUE_ID",
                 "transform_state": ("STRING", {"default": "{}"}),
             },
         }
@@ -37,6 +45,7 @@ class MaskCanvasEditor:
     RETURN_NAMES = ("cropped_image", "cropped_mask")
     FUNCTION = "process"
     CATEGORY = "Mask/CanvasEditor"
+    OUTPUT_NODE = False
     DESCRIPTION = (
         "Interactive canvas editor — the node body is a visual canvas. "
         "Drag to pan the background image behind the mask, scroll to zoom, "
@@ -45,8 +54,6 @@ class MaskCanvasEditor:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        # Re-execute whenever transform state changes
-        # NaN forces re-execution every queue; we use the state hash for efficiency
         ts = kwargs.get("transform_state", "{}")
         return ts
 
@@ -108,7 +115,6 @@ class MaskCanvasEditor:
         rx = ox_abs - bbox_cx
         ry = oy_abs - bbox_cy
 
-        # Inverse transforms (output pixel → source pixel)
         rx_t = rx - offset_x
         ry_t = ry - offset_y
 
@@ -130,6 +136,37 @@ class MaskCanvasEditor:
         return torch.stack([gx, gy], dim=-1).unsqueeze(0)
 
     # ------------------------------------------------------------------
+    #  Save input image preview for the frontend canvas
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _save_preview(image: torch.Tensor, unique_id: str) -> str:
+        """
+        Save a downsampled version of the input image to ComfyUI's temp directory.
+        Returns the filename.
+        """
+        # Get first frame: (H, W, C) float [0,1]
+        img_np = image[0].cpu().numpy()
+
+        h, w = img_np.shape[:2]
+
+        # Downsample for preview (max edge = 1024px)
+        max_size = 1024
+        if max(h, w) > max_size:
+            ratio = max_size / max(h, w)
+            new_w = max(1, int(w * ratio))
+            new_h = max(1, int(h * ratio))
+            img_pil = Image.fromarray((img_np * 255).clip(0, 255).astype(np.uint8))
+            img_pil = img_pil.resize((new_w, new_h), Image.LANCZOS)
+        else:
+            img_pil = Image.fromarray((img_np * 255).clip(0, 255).astype(np.uint8))
+
+        # Save to ComfyUI temp folder
+        filename = f"mce_bg_{unique_id}.png"
+        filepath = os.path.join(folder_paths.get_temp_directory(), filename)
+        img_pil.save(filepath, compress_level=1)
+        return filename
+
+    # ------------------------------------------------------------------
     #  Main processing
     # ------------------------------------------------------------------
     def process(
@@ -137,12 +174,14 @@ class MaskCanvasEditor:
         mask: torch.Tensor,
         image: torch.Tensor,
         transform_state: str = "{}",
+        unique_id: str = "0",
     ):
         """
         Args:
             mask:             (B, H, W) mask defining the crop region
             image:            (B, H, W, C) background image
             transform_state:  JSON string from the JS canvas editor
+            unique_id:        ComfyUI node ID (hidden input)
 
         Returns:
             cropped_image: (B, H', W', C)
@@ -156,6 +195,9 @@ class MaskCanvasEditor:
         flip_v = bool(state.get("flipV", False))
         offset_x = int(state.get("offsetX", 0))
         offset_y = int(state.get("offsetY", 0))
+
+        # Save input image preview for the frontend canvas
+        preview_filename = self._save_preview(image, unique_id)
 
         batch_size = mask.shape[0]
         device = image.device
@@ -200,10 +242,19 @@ class MaskCanvasEditor:
             cropped_images.append(sampled_masked)
             cropped_masks.append(m_cropped)
 
-        return (
-            torch.stack(cropped_images, dim=0),
-            torch.stack(cropped_masks, dim=0),
-        )
+        return {
+            "ui": {
+                "mce_preview": [{
+                    "filename": preview_filename,
+                    "subfolder": "",
+                    "type": "temp",
+                }],
+            },
+            "result": (
+                torch.stack(cropped_images, dim=0),
+                torch.stack(cropped_masks, dim=0),
+            ),
+        }
 
 
 NODE_CLASS_MAPPINGS = {

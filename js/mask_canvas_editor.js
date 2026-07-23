@@ -2,11 +2,11 @@
  * Mask Canvas Editor — Frontend Extension
  *
  * Compact node with a floating DOM-based canvas editor panel.
- * Inspired by ComfyUI-ZhiHui's drawing board pattern:
- * - Node body is small (240×80), shows a button + thumbnail
- * - Floating window with full interactive canvas opens on click
- * - Drag to pan, scroll to zoom, shift+scroll to rotate
- * - Flip/reset toolbar, Apply button writes state back
+ * Coordinate system is in ORIGINAL-IMAGE pixel space:
+ * - Zoom-to-fit base transform so the full image is visible on canvas
+ * - Mask window drawn at actual bbox size (from Python metadata)
+ * - offsetX/Y are in original image pixel space (consistent with Python)
+ * - All transforms (scale, rotation, flip) work in the same space
  */
 
 import { app } from "../../scripts/app.js";
@@ -23,9 +23,9 @@ const DEFAULT_STATE = {
 };
 
 const PANEL_W = 800;
-const PANEL_H = 560;
+const PANEL_H = 600;
 const CANVAS_W = 960;
-const CANVAS_H = 540;
+const CANVAS_H = 600;
 
 // ─────────────────────────────────────────────────────────────
 //  Extension
@@ -36,7 +36,6 @@ app.registerExtension({
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (nodeData.name !== NODE_TYPE) return;
 
-    // ── onNodeCreated ──────────────────────────────────────
     const origOnCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       origOnCreated?.apply(this, arguments);
@@ -45,6 +44,11 @@ app.registerExtension({
       this.__mce_img = null;
       this.__mce_imgW = 0;
       this.__mce_imgH = 0;
+      this.__mce_origW = 0;
+      this.__mce_origH = 0;
+      this.__mce_bboxW = 0;
+      this.__mce_bboxH = 0;
+      this.__mce_zoom = 1;
 
       // Hidden bridge widget for transform_state
       const sw = this.addWidget("text", "transform_state", "{}", () => {}, {});
@@ -53,7 +57,6 @@ app.registerExtension({
       sw.draw = () => {};
       sw.serializeValue = () => JSON.stringify(this.__mce_state);
 
-      // Restore saved state
       try {
         const v = sw.value;
         if (v && v !== "{}") {
@@ -61,12 +64,10 @@ app.registerExtension({
         }
       } catch (_) {}
 
-      // Add the open button widget
       this.addWidget("button", "🎨 Open Canvas Editor", null, () => {
         this._openEditor();
       });
 
-      // Node size hint at bottom
       this.onResize?.(this.size);
     };
 
@@ -82,20 +83,17 @@ app.registerExtension({
       }
     };
 
-    // ── onDrawForeground (tiny thumbnail preview) ──────────
+    // ── onDrawForeground (thumbnail preview on compact node) ──
     const origFg = nodeType.prototype.onDrawForeground;
     nodeType.prototype.onDrawForeground = function (ctx) {
       origFg?.apply(this, arguments);
       if (this.flags?.collapsed) return;
-
-      // Draw a small thumbnail if we have a preview image
       if (this.__mce_img && this.__mce_img.complete && this.__mce_img.naturalWidth > 0) {
         const W = this.size[0];
         const H = this.size[1];
-        const thumbH = H - 38; // leave room for button widget
+        const thumbH = H - 38;
         if (thumbH > 20) {
           ctx.save();
-          // Clip to rounded rect
           const r = 4;
           ctx.beginPath();
           ctx.moveTo(r, 20); ctx.lineTo(W - r, 20);
@@ -108,30 +106,29 @@ app.registerExtension({
           ctx.quadraticCurveTo(0, 20, r, 20);
           ctx.closePath();
           ctx.clip();
-
-          // Draw image scaled to fit
-          const iw = this.__mce_imgW;
-          const ih = this.__mce_imgH;
-          const scale = Math.min(W / iw, thumbH / ih, 1);
-          const dw = iw * scale;
-          const dh = ih * scale;
-          const dx = (W - dw) / 2;
-          const dy = 20 + (thumbH - dh) / 2;
-
           ctx.fillStyle = "#11111b";
           ctx.fillRect(0, 20, W, thumbH);
-          ctx.drawImage(this.__mce_img, dx, dy, dw, dh);
-
+          const scale = Math.min(W / this.__mce_imgW, thumbH / this.__mce_imgH, 1);
+          const dw = this.__mce_imgW * scale;
+          const dh = this.__mce_imgH * scale;
+          ctx.drawImage(this.__mce_img, (W - dw) / 2, 20 + (thumbH - dh) / 2, dw, dh);
           ctx.restore();
         }
       }
     };
 
-    // ── onExecuted ─────────────────────────────────────────
+    // ── onExecuted: receive preview + coordinate info ──────
     const origExec = nodeType.prototype.onExecuted;
     nodeType.prototype.onExecuted = function (message) {
       origExec?.apply(this, arguments);
       const preview = message?.mce_preview?.[0];
+      const info = message?.mce_info?.[0];
+      if (info) {
+        this.__mce_origW = info.orig_w || 0;
+        this.__mce_origH = info.orig_h || 0;
+        this.__mce_bboxW = info.bbox_w || 0;
+        this.__mce_bboxH = info.bbox_h || 0;
+      }
       if (!preview) return;
       const url = `/view?filename=${preview.filename}&subfolder=${preview.subfolder || ""}&type=${preview.type || "temp"}&t=${Date.now()}`;
       if (url === this.__mce_previewUrl) return;
@@ -155,10 +152,9 @@ app.registerExtension({
       }
 
       const self = this;
-      const img = this.__mce_img;
       const state = this.__mce_state;
 
-      // ── Create the floating panel ──
+      // ── Panel DOM ──
       const panel = document.createElement("div");
       panel.id = `mce-panel-${this.id}`;
       panel.style.cssText = `
@@ -188,40 +184,28 @@ app.registerExtension({
       title.style.cssText = "font-weight:700;font-size:15px;color:#cdd6f4;margin-right:8px;";
       header.appendChild(title);
 
-      // Flip buttons
-      const flipHBtn = document.createElement("button");
-      flipHBtn.textContent = state.flipH ? "↔ H  ✓" : "↔ H";
-      flipHBtn.style.cssText = btnStyle(state.flipH ? "#89b4fa" : "#313244", state.flipH ? "#1e1e2e" : "#cdd6f4");
-      flipHBtn.onclick = () => { state.flipH = !state.flipH; flipHBtn.textContent = state.flipH ? "↔ H  ✓" : "↔ H"; updateBtnStyle(flipHBtn, state.flipH ? "#89b4fa" : "#313244", state.flipH ? "#1e1e2e" : "#cdd6f4"); renderPanelCanvas(); };
-      header.appendChild(flipHBtn);
-
-      const flipVBtn = document.createElement("button");
-      flipVBtn.textContent = state.flipV ? "↕ V  ✓" : "↕ V";
-      flipVBtn.style.cssText = btnStyle(state.flipV ? "#a6e3a1" : "#313244", state.flipV ? "#1e1e2e" : "#cdd6f4");
-      flipVBtn.onclick = () => { state.flipV = !state.flipV; flipVBtn.textContent = state.flipV ? "↕ V  ✓" : "↕ V"; updateBtnStyle(flipVBtn, state.flipV ? "#a6e3a1" : "#313244", state.flipV ? "#1e1e2e" : "#cdd6f4"); renderPanelCanvas(); };
-      header.appendChild(flipVBtn);
-
-      // Reset button
-      const resetBtn = document.createElement("button");
-      resetBtn.textContent = "↺ Reset";
-      resetBtn.style.cssText = btnStyle("#45475a", "#cdd6f4");
-      resetBtn.onclick = () => {
+      const flipHBtn = makeBtn(state.flipH ? "↔ H ✓" : "↔ H",
+        state.flipH ? "#89b4fa" : "#313244",
+        state.flipH ? "#1e1e2e" : "#cdd6f4",
+        () => { state.flipH = !state.flipH; updateFlipBtns(); render(); });
+      const flipVBtn = makeBtn(state.flipV ? "↕ V ✓" : "↕ V",
+        state.flipV ? "#a6e3a1" : "#313244",
+        state.flipV ? "#1e1e2e" : "#cdd6f4",
+        () => { state.flipV = !state.flipV; updateFlipBtns(); render(); });
+      const resetBtn = makeBtn("↺ Reset", "#45475a", "#cdd6f4", () => {
         state.scale = 1; state.rotation = 0;
         state.flipH = false; state.flipV = false;
         state.offsetX = 0; state.offsetY = 0;
-        flipHBtn.textContent = "↔ H"; updateBtnStyle(flipHBtn, "#313244", "#cdd6f4");
-        flipVBtn.textContent = "↕ V"; updateBtnStyle(flipVBtn, "#313244", "#cdd6f4");
-        updateInfo();
-        renderPanelCanvas();
-      };
+        updateFlipBtns(); syncSliders(); updateInfo(); render();
+      });
+      header.appendChild(flipHBtn);
+      header.appendChild(flipVBtn);
       header.appendChild(resetBtn);
 
-      // Spacer
       const spacer = document.createElement("div");
       spacer.style.flex = "1";
       header.appendChild(spacer);
 
-      // Close button
       const closeBtn = document.createElement("button");
       closeBtn.textContent = "✕";
       closeBtn.style.cssText = `
@@ -231,7 +215,6 @@ app.registerExtension({
       closeBtn.onclick = () => closePanel(false);
       header.appendChild(closeBtn);
 
-      // Drag to move
       header.onpointerdown = (e) => {
         if (e.target.closest("button")) return;
         e.preventDefault();
@@ -241,15 +224,13 @@ app.registerExtension({
           panel.style.left = Math.max(0, ev.clientX - sx) + "px";
           panel.style.top = Math.max(0, ev.clientY - sy) + "px";
         };
-        const onUp = () => {
-          document.removeEventListener("pointermove", onMove);
-          document.removeEventListener("pointerup", onUp);
-        };
         document.addEventListener("pointermove", onMove);
-        document.addEventListener("pointerup", onUp);
+        document.addEventListener("pointerup", () => {
+          document.removeEventListener("pointermove", onMove);
+        }, { once: true });
       };
 
-      // ── Body: Canvas area ──
+      // ── Body ──
       const body = document.createElement("div");
       body.style.cssText = "flex:1;min-height:0;display:flex;overflow:hidden;";
 
@@ -259,13 +240,11 @@ app.registerExtension({
         display:flex; align-items:center; justify-content:center;
         background:#11111b;
       `;
-
       const canvas = document.createElement("canvas");
       canvas.style.cssText = "cursor:grab;";
       canvas.width = CANVAS_W;
       canvas.height = CANVAS_H;
       canvasWrap.appendChild(canvas);
-
       body.appendChild(canvasWrap);
 
       // ── Sidebar ──
@@ -277,21 +256,39 @@ app.registerExtension({
         gap:12px; font-size:13px;
       `;
 
+      function getInfoText() {
+        const oW = self.__mce_origW || self.__mce_imgW || 0;
+        const oH = self.__mce_origH || self.__mce_imgH || 0;
+        const bW = self.__mce_bboxW || 0;
+        const bH = self.__mce_bboxH || 0;
+        let t = "";
+        if (oW && oH) t += `Image: ${oW}×${oH}\n`;
+        if (bW && bH) t += `Mask: ${bW}×${bH}\n`;
+        t += `Display: ${CANVAS_W}×${CANVAS_H}`;
+        return t;
+      }
+
       sidebar.innerHTML = `
         <div style="font-weight:600;font-size:14px;border-bottom:1px solid #313244;padding-bottom:8px;">Controls</div>
-        <div><label style="display:flex;justify-content:space-between;">Scale <span id="mce-val-scale" style="color:#89b4fa;">${state.scale.toFixed(2)}</span></label>
-          <input type="range" id="mce-sl-scale" min="0.1" max="5" step="0.01" value="${state.scale}" style="width:100%;accent-color:#89b4fa;"></div>
-        <div><label style="display:flex;justify-content:space-between;">Rotation <span id="mce-val-rot" style="color:#a6e3a1;">${state.rotation.toFixed(1)}°</span></label>
-          <input type="range" id="mce-sl-rot" min="-180" max="180" step="0.5" value="${state.rotation}" style="width:100%;accent-color:#a6e3a1;"></div>
-        <div><label style="display:flex;justify-content:space-between;">Offset X <span id="mce-val-ox" style="color:#fab387;">${state.offsetX}</span></label>
-          <input type="range" id="mce-sl-ox" min="-2048" max="2048" step="1" value="${state.offsetX}" style="width:100%;accent-color:#fab387;"></div>
-        <div><label style="display:flex;justify-content:space-between;">Offset Y <span id="mce-val-oy" style="color:#f9e2af;">${state.offsetY}</span></label>
-          <input type="range" id="mce-sl-oy" min="-2048" max="2048" step="1" value="${state.offsetY}" style="width:100%;accent-color:#f9e2af;"></div>
+        <div><label style="display:flex;justify-content:space-between;">Scale <span id="mce-v-scale" style="color:#89b4fa;">${state.scale.toFixed(2)}</span></label>
+          <input type="range" id="mce-s-scale" min="0.1" max="5" step="0.01" value="${state.scale}" style="width:100%;accent-color:#89b4fa;"></div>
+        <div><label style="display:flex;justify-content:space-between;">Rotation <span id="mce-v-rot" style="color:#a6e3a1;">${state.rotation.toFixed(1)}°</span></label>
+          <input type="range" id="mce-s-rot" min="-180" max="180" step="0.5" value="${state.rotation}" style="width:100%;accent-color:#a6e3a1;"></div>
+        <div><label style="display:flex;justify-content:space-between;">Offset X <span id="mce-v-ox" style="color:#fab387;">${state.offsetX}</span></label>
+          <input type="range" id="mce-s-ox" min="-8192" max="8192" step="1" value="${state.offsetX}" style="width:100%;accent-color:#fab387;"></div>
+        <div><label style="display:flex;justify-content:space-between;">Offset Y <span id="mce-v-oy" style="color:#f9e2af;">${state.offsetY}</span></label>
+          <input type="range" id="mce-s-oy" min="-8192" max="8192" step="1" value="${state.offsetY}" style="width:100%;accent-color:#f9e2af;"></div>
+        <pre id="mce-info-box" style="
+          background:#11111b; border-radius:6px; padding:8px;
+          font-size:11px; line-height:1.5; color:#6c7086;
+          margin:0; white-space:pre-wrap;
+        ">${getInfoText()}</pre>
         <div style="margin-top:auto;padding-top:10px;border-top:1px solid #313244;color:#6c7086;font-size:11px;line-height:1.5;">
           <div>🖱 <b>Drag</b> to pan</div>
           <div>🖱 <b>Scroll</b> to zoom</div>
           <div>🖱 <b>Shift+Scroll</b> to rotate</div>
-          <div style="margin-top:6px;">The mask is the fixed window —<br>the background image moves behind it.</div>
+          <div>⌨ <b>R</b> to reset</div>
+          <div style="margin-top:6px;">Mask window size = actual crop output size.</div>
         </div>
       `;
 
@@ -304,49 +301,53 @@ app.registerExtension({
         padding:10px 14px; background:#181825;
         border-top:1px solid #313244; flex-shrink:0;
       `;
-
       const statusText = document.createElement("span");
       statusText.style.cssText = "font-size:11px;color:#6c7086;flex:1;";
-      statusText.textContent = "Position the image behind the mask";
+      statusText.textContent = "Preview matches output";
       footer.appendChild(statusText);
+      footer.appendChild(makeBtn("Cancel", "#313244", "#cdd6f4", () => closePanel(false)));
+      footer.appendChild(makeBtn("✅ Apply", "#89b4fa", "#1e1e2e", () => closePanel(true)));
 
-      const cancelBtn = document.createElement("button");
-      cancelBtn.textContent = "Cancel";
-      cancelBtn.style.cssText = btnStyle("#313244", "#cdd6f4");
-      cancelBtn.onclick = () => closePanel(false);
-      footer.appendChild(cancelBtn);
-
-      const applyBtn = document.createElement("button");
-      applyBtn.textContent = "✅ Apply";
-      applyBtn.style.cssText = `
-        padding:8px 20px; border-radius:8px; border:none;
-        background:#89b4fa; color:#1e1e2e; cursor:pointer;
-        font-weight:600; font-size:13px;
-      `;
-      applyBtn.onclick = () => closePanel(true);
-      footer.appendChild(applyBtn);
-
-      // ── Assemble ──
       panel.appendChild(header);
       panel.appendChild(body);
       panel.appendChild(footer);
       document.body.appendChild(panel);
 
-      // ── Helper functions ──
-      function updateInfo() {
-        const els = {
-          "mce-val-scale": state.scale.toFixed(2),
-          "mce-val-rot": state.rotation.toFixed(1) + "°",
-          "mce-val-ox": state.offsetX,
-          "mce-val-oy": state.offsetY,
-        };
-        for (const [id, val] of Object.entries(els)) {
-          const el = panel.querySelector(`#${id}`);
-          if (el) el.textContent = val;
-        }
+      // ── Helper state ──
+      self.__mce_zoom = 1; // will be recomputed in render()
+
+      function updateFlipBtns() {
+        flipHBtn.textContent = state.flipH ? "↔ H ✓" : "↔ H";
+        flipHBtn.style.background = state.flipH ? "#89b4fa" : "#313244";
+        flipHBtn.style.color = state.flipH ? "#1e1e2e" : "#cdd6f4";
+        flipVBtn.textContent = state.flipV ? "↕ V ✓" : "↕ V";
+        flipVBtn.style.background = state.flipV ? "#a6e3a1" : "#313244";
+        flipVBtn.style.color = state.flipV ? "#1e1e2e" : "#cdd6f4";
       }
 
-      function renderPanelCanvas() {
+      function updateInfo() {
+        setText("mce-v-scale", state.scale.toFixed(2));
+        setText("mce-v-rot", state.rotation.toFixed(1) + "°");
+        setText("mce-v-ox", state.offsetX);
+        setText("mce-v-oy", state.offsetY);
+        const b = panel.querySelector("#mce-info-box");
+        if (b) b.textContent = getInfoText();
+      }
+
+      function setText(id, val) {
+        const el = panel.querySelector(`#${id}`);
+        if (el) el.textContent = val;
+      }
+
+      function syncSliders() {
+        panel.querySelector("#mce-s-scale").value = state.scale;
+        panel.querySelector("#mce-s-rot").value = state.rotation;
+        panel.querySelector("#mce-s-ox").value = state.offsetX;
+        panel.querySelector("#mce-s-oy").value = state.offsetY;
+      }
+
+      // ── Canvas render (unified coordinate system) ─────────
+      function render() {
         const ctx = canvas.getContext("2d");
         const W = CANVAS_W, H = CANVAS_H;
         ctx.clearRect(0, 0, W, H);
@@ -354,38 +355,60 @@ app.registerExtension({
         ctx.fillRect(0, 0, W, H);
 
         const cx = W / 2, cy = H / 2;
-        const mw = Math.min(W * 0.5, H * 0.5, 300);
-        const mh = mw;
-        const mx = cx - mw / 2, my = cy - mh / 2;
 
-        // ── Draw background image with transforms ──
+        // Original image dimensions (in actual image pixel space)
+        const origW = self.__mce_origW || self.__mce_imgW || W;
+        const origH = self.__mce_origH || self.__mce_imgH || H;
+        // Mask bbox dimensions (in actual image pixel space)
+        const bboxW = self.__mce_bboxW || Math.round(Math.min(W * 0.3, 200));
+        const bboxH = self.__mce_bboxH || Math.round(Math.min(H * 0.3, 200));
+
+        // Zoom-to-fit: show the full image centered in the canvas
+        // This is the base zoom — 1 "image pixel" = zoom "canvas pixels"
+        const zoom = Math.max(0.05, Math.min(
+          W * 0.85 / Math.max(origW, 1),
+          H * 0.85 / Math.max(origH, 1),
+          5.0
+        ));
+        self.__mce_zoom = zoom;
+
+        // ── Draw image with transforms ──
         ctx.save();
         ctx.translate(cx, cy);
-        ctx.scale(state.scale, state.scale);
-        ctx.rotate((state.rotation * Math.PI) / 180);
-        if (state.flipH) ctx.scale(-1, 1);
-        if (state.flipV) ctx.scale(1, -1);
-        ctx.translate(state.offsetX, state.offsetY);
+        ctx.scale(zoom, zoom);                       // base zoom (fit image to canvas)
+        ctx.scale(state.scale, state.scale);          // user scale
+        ctx.rotate((state.rotation * Math.PI) / 180); // user rotation
+        if (state.flipH) ctx.scale(-1, 1);           // user flip H
+        if (state.flipV) ctx.scale(1, -1);           // user flip V
+        ctx.translate(state.offsetX, state.offsetY);  // user offset (in image pixels)
 
         if (self.__mce_img && self.__mce_img.complete && self.__mce_img.naturalWidth > 0) {
-          ctx.drawImage(self.__mce_img, -self.__mce_imgW / 2, -self.__mce_imgH / 2, self.__mce_imgW, self.__mce_imgH);
+          // Draw preview image stretched to original image pixel dimensions
+          // (ctx.drawImage handles the stretch)
+          ctx.drawImage(self.__mce_img, -origW / 2, -origH / 2, origW, origH);
+          // Image edge highlight
           ctx.strokeStyle = "rgba(203,166,247,0.2)";
-          ctx.lineWidth = 1;
-          ctx.strokeRect(-self.__mce_imgW / 2, -self.__mce_imgH / 2, self.__mce_imgW, self.__mce_imgH);
+          ctx.lineWidth = 1 / (zoom * Math.max(state.scale, 0.01));
+          ctx.strokeRect(-origW / 2, -origH / 2, origW, origH);
         } else {
-          // Grid fallback
-          drawGrid(ctx, W, H);
+          drawGrid(ctx, W / zoom, H / zoom);
         }
         ctx.restore();
 
-        // ── Mask overlay ──
+        // ── Mask window (canvas pixel space) ──
+        const mw = bboxW * zoom;
+        const mh = bboxH * zoom;
+        const mx = cx - mw / 2;
+        const my = cy - mh / 2;
+
+        // Semi-transparent overlay outside mask
         ctx.fillStyle = "rgba(0,0,0,0.55)";
         ctx.fillRect(0, 0, W, my);
         ctx.fillRect(0, my + mh, W, H - (my + mh));
         ctx.fillRect(0, my, mx, mh);
         ctx.fillRect(mx + mw, my, W - (mx + mw), mh);
 
-        // Mask border
+        // Mask border (dashed)
         ctx.strokeStyle = "#89b4fa";
         ctx.lineWidth = 2;
         ctx.setLineDash([6, 3]);
@@ -395,14 +418,17 @@ app.registerExtension({
         // Corner markers
         ctx.strokeStyle = "#cba6f7";
         ctx.lineWidth = 3;
-        const cl = 16;
-        const c = (x, y, dx1, dy1, dx2, dy2) => {
-          ctx.beginPath(); ctx.moveTo(x + dx1, y + dy1); ctx.lineTo(x, y); ctx.lineTo(x + dx2, y + dy2); ctx.stroke();
-        };
-        c(mx, my, cl, 0, 0, cl);
-        c(mx + mw, my, -cl, 0, 0, cl);
-        c(mx, my + mh, cl, 0, 0, -cl);
-        c(mx + mw, my + mh, -cl, 0, 0, -cl);
+        const cl = Math.min(16, mw * 0.2, mh * 0.2);
+        if (cl >= 6) {
+          const corner = (x, y, dx1, dy1, dx2, dy2) => {
+            ctx.beginPath(); ctx.moveTo(x + dx1, y + dy1);
+            ctx.lineTo(x, y); ctx.lineTo(x + dx2, y + dy2); ctx.stroke();
+          };
+          corner(mx, my, cl, 0, 0, cl);
+          corner(mx + mw, my, -cl, 0, 0, cl);
+          corner(mx, my + mh, cl, 0, 0, -cl);
+          corner(mx + mw, my + mh, -cl, 0, 0, -cl);
+        }
 
         // Crosshair
         ctx.strokeStyle = "rgba(203,166,247,0.35)";
@@ -413,18 +439,19 @@ app.registerExtension({
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // Info label
+        // Info label (bottom-left of mask)
         ctx.fillStyle = "rgba(198,160,246,0.7)";
         ctx.font = "10px sans-serif";
         ctx.textAlign = "left";
         ctx.fillText(
-          `${Math.round(mw)}×${Math.round(mh)}  S:${state.scale.toFixed(2)}  R:${state.rotation.toFixed(0)}°${state.flipH?" H":""}${state.flipV?" V":""}`,
+          `Mask:${bboxW}×${bboxH}  S:${state.scale.toFixed(2)}  R:${state.rotation.toFixed(0)}°` +
+          (state.flipH ? " H" : "") + (state.flipV ? " V" : ""),
           mx + 4, my + mh + 14
         );
 
         // Canvas size label (bottom-right)
         const label = `${CANVAS_W} × ${CANVAS_H}`;
-        ctx.font = "bold 12px monospace";
+        ctx.font = "bold 11px monospace";
         const lw = ctx.measureText(label).width;
         ctx.fillStyle = "rgba(0,0,0,0.45)";
         ctx.fillRect(W - lw - 14, H - 26, lw + 10, 20);
@@ -434,66 +461,64 @@ app.registerExtension({
         ctx.textAlign = "start";
       }
 
-      // ── Slider events ──
-      const bindSlider = (slId, valId, key, parseFn, formatFn) => {
+      // ── Slider binding ──
+      function bindSlider(slId, valId, key, parseFn, fmtFn) {
         const sl = panel.querySelector(`#${slId}`);
-        const vl = panel.querySelector(`#${valId}`);
         if (!sl) return;
         sl.addEventListener("input", () => {
-          const v = parseFn(sl.value);
-          state[key] = v;
-          if (vl) vl.textContent = formatFn ? formatFn(v) : v;
-          renderPanelCanvas();
+          state[key] = parseFn(sl.value);
+          const v = panel.querySelector(`#${valId}`);
+          if (v) v.textContent = fmtFn(state[key]);
+          render();
         });
-      };
-      bindSlider("mce-sl-scale", "mce-val-scale", "scale", parseFloat, (v) => v.toFixed(2));
-      bindSlider("mce-sl-rot", "mce-val-rot", "rotation", parseFloat, (v) => v.toFixed(1) + "°");
-      bindSlider("mce-sl-ox", "mce-val-ox", "offsetX", parseInt, (v) => v);
-      bindSlider("mce-sl-oy", "mce-val-oy", "offsetY", parseInt, (v) => v);
+      }
+      bindSlider("mce-s-scale", "mce-v-scale", "scale", parseFloat, (v) => v.toFixed(2));
+      bindSlider("mce-s-rot", "mce-v-rot", "rotation", parseFloat, (v) => v.toFixed(1) + "°");
+      bindSlider("mce-s-ox", "mce-v-ox", "offsetX", (v) => parseInt(v) || 0, (v) => v);
+      bindSlider("mce-s-oy", "mce-v-oy", "offsetY", (v) => parseInt(v) || 0, (v) => v);
 
-      // ── Canvas mouse interaction ──
-      let dragging = false, dragSX = 0, dragSY = 0, dragOX = 0, dragOY = 0;
+      // ── Canvas mouse drag ──
+      let dragging = false, dsx = 0, dsy = 0, dox = 0, doy = 0;
 
       canvas.addEventListener("mousedown", (e) => {
         dragging = true;
-        dragSX = e.clientX; dragSY = e.clientY;
-        dragOX = state.offsetX; dragOY = state.offsetY;
+        dsx = e.clientX; dsy = e.clientY;
+        dox = state.offsetX; doy = state.offsetY;
         canvas.style.cursor = "grabbing";
       });
 
       window.addEventListener("mousemove", (e) => {
         if (!dragging) return;
-        const sens = 1 / Math.max(state.scale, 0.1);
-        state.offsetX = Math.round(dragOX + (e.clientX - dragSX) * sens);
-        state.offsetY = Math.round(dragOY + (e.clientY - dragSY) * sens);
-        state.offsetX = Math.max(-8192, Math.min(8192, state.offsetX));
-        state.offsetY = Math.max(-8192, Math.min(8192, state.offsetY));
-        panel.querySelector("#mce-sl-ox").value = state.offsetX;
-        panel.querySelector("#mce-sl-oy").value = state.offsetY;
+        // Drag sensitivity: screen delta → image pixel delta
+        // 1 screen pixel = 1/(zoom * scale) image pixels
+        const sens = 1 / (self.__mce_zoom * Math.max(state.scale, 0.1));
+        const dx = Math.round((e.clientX - dsx) * sens);
+        const dy = Math.round((e.clientY - dsy) * sens);
+        state.offsetX = Math.max(-8192, Math.min(8192, dox + dx));
+        state.offsetY = Math.max(-8192, Math.min(8192, doy + dy));
+        syncSliders();
         updateInfo();
-        renderPanelCanvas();
+        render();
       });
 
       window.addEventListener("mouseup", () => {
-        if (dragging) {
-          dragging = false;
-          canvas.style.cursor = "grab";
-        }
+        if (dragging) { dragging = false; canvas.style.cursor = "grab"; }
       });
 
+      // ── Canvas wheel ──
       canvas.addEventListener("wheel", (e) => {
         e.preventDefault();
         if (e.shiftKey) {
           state.rotation += e.deltaY > 0 ? -5 : 5;
           state.rotation = Math.max(-180, Math.min(180, state.rotation));
-          panel.querySelector("#mce-sl-rot").value = state.rotation;
+          panel.querySelector("#mce-s-rot").value = state.rotation;
         } else {
           state.scale += e.deltaY > 0 ? -0.05 : 0.05;
           state.scale = Math.max(0.01, Math.min(10, Math.round(state.scale * 100) / 100));
-          panel.querySelector("#mce-sl-scale").value = state.scale;
+          panel.querySelector("#mce-s-scale").value = state.scale;
         }
         updateInfo();
-        renderPanelCanvas();
+        render();
       }, { passive: false });
 
       // ── Keyboard ──
@@ -504,15 +529,13 @@ app.registerExtension({
         }
         if (e.key === "Escape") closePanel(false);
         if (e.key === "Enter" && !e.shiftKey) closePanel(true);
-        if (e.key === "r" && !e.ctrlKey && !e.metaKey) { resetBtn.onclick(); }
+        if (e.key === "r" && !e.ctrlKey && !e.metaKey) resetBtn.onclick();
       };
       document.addEventListener("keydown", onKeyDown);
 
-      // ── Close panel ──
+      // ── Close ──
       function closePanel(apply) {
         if (apply) {
-          self.__mce_state = state;
-          // Write to hidden bridge widget
           const sw = self.widgets?.find((w) => w.name === "transform_state");
           if (sw) sw.value = JSON.stringify(state);
           if (self.graph) self.graph._version = (self.graph._version || 0) + 1;
@@ -522,28 +545,26 @@ app.registerExtension({
         self.__mce_panel = null;
       }
 
-      // ── Initial render ──
-      renderPanelCanvas();
+      // ── Kick off ──
+      render();
     };
   },
 });
 
-// ── Utility functions ─────────────────────────────────────
-function btnStyle(bg, fg) {
-  return `padding:6px 12px;border-radius:6px;border:1px solid rgba(69,71,90,.4);background:${bg};color:${fg};cursor:pointer;font-size:12px;font-weight:600;`;
-}
-
-function updateBtnStyle(btn, bg, fg) {
-  btn.style.background = bg;
-  btn.style.color = fg;
+// ── Utilities ─────────────────────────────────────────────
+function makeBtn(label, bg, fg, onClick) {
+  const btn = document.createElement("button");
+  btn.textContent = label;
+  btn.style.cssText = `padding:6px 12px;border-radius:6px;border:1px solid rgba(69,71,90,.4);background:${bg};color:${fg};cursor:pointer;font-size:12px;font-weight:600;`;
+  btn.onclick = onClick;
+  return btn;
 }
 
 function drawGrid(ctx, W, H) {
   const ext = Math.max(W, H) * 2;
-  const step = 64;
-  const s = -ext, e = ext;
-  for (let y = s; y < e; y += step) {
-    for (let x = s; x < e; x += step) {
+  const step = Math.max(32, Math.min(128, Math.min(W, H) / 8));
+  for (let y = -ext; y < ext; y += step) {
+    for (let x = -ext; x < ext; x += step) {
       ctx.fillStyle = ((Math.floor(x / step) + Math.floor(y / step)) & 1) === 0 ? "#2a2a3a" : "#1e1e2e";
       ctx.fillRect(x, y, step, step);
     }
@@ -551,8 +572,8 @@ function drawGrid(ctx, W, H) {
   ctx.strokeStyle = "rgba(137,180,250,0.12)";
   ctx.lineWidth = 1;
   ctx.beginPath();
-  for (let x = s; x <= e; x += step) { ctx.moveTo(x, s); ctx.lineTo(x, e); }
-  for (let y = s; y <= e; y += step) { ctx.moveTo(s, y); ctx.lineTo(e, y); }
+  for (let x = -ext; x <= ext; x += step) { ctx.moveTo(x, -ext); ctx.lineTo(x, ext); }
+  for (let y = -ext; y <= ext; y += step) { ctx.moveTo(-ext, y); ctx.lineTo(ext, y); }
   ctx.stroke();
   ctx.strokeStyle = "rgba(137,180,250,0.45)";
   ctx.lineWidth = 2;

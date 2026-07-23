@@ -20,13 +20,6 @@ import folder_paths
 
 
 class MaskCanvasEditor:
-    """
-    Interactive canvas editor — the node body IS the editor.
-
-    The mask defines a fixed "window" at the center. The background image
-    is transformed behind it. All parameters (scale, rotation, flip, offset)
-    are controlled by direct canvas interaction, not slider widgets.
-    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -54,17 +47,12 @@ class MaskCanvasEditor:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        ts = kwargs.get("transform_state", "{}")
-        return ts
+        return kwargs.get("transform_state", "{}")
 
-    # ------------------------------------------------------------------
-    #  Helper: bounding box from a binary mask
-    # ------------------------------------------------------------------
     @staticmethod
     def _get_bbox(mask: torch.Tensor):
         rows = torch.any(mask > 0.5, dim=1)
         cols = torch.any(mask > 0.5, dim=0)
-
         if rows.any() and cols.any():
             row_indices = torch.where(rows)[0]
             col_indices = torch.where(cols)[0]
@@ -75,12 +63,8 @@ class MaskCanvasEditor:
         else:
             y_min, y_max = 0, mask.shape[0]
             x_min, x_max = 0, mask.shape[1]
-
         return y_min, y_max, x_min, x_max
 
-    # ------------------------------------------------------------------
-    #  Helper: build the sampling grid
-    # ------------------------------------------------------------------
     @staticmethod
     def _build_sampling_grid(
         bbox_h: int, bbox_w: int,
@@ -135,22 +119,17 @@ class MaskCanvasEditor:
 
         return torch.stack([gx, gy], dim=-1).unsqueeze(0)
 
-    # ------------------------------------------------------------------
-    #  Save input image preview for the frontend canvas
-    # ------------------------------------------------------------------
     @staticmethod
-    def _save_preview(image: torch.Tensor, unique_id: str) -> str:
+    def _save_preview(image: torch.Tensor, unique_id: str) -> tuple:
         """
-        Save a downsampled version of the input image to ComfyUI's temp directory.
-        Returns the filename.
+        Save a downsampled copy of the input image to ComfyUI's temp directory.
+        Returns (filename, orig_h, orig_w) where orig_h/w are the original
+        image dimensions (pre-downscale).
         """
-        # Get first frame: (H, W, C) float [0,1]
         img_np = image[0].cpu().numpy()
-
         h, w = img_np.shape[:2]
 
-        # Downsample for preview (max edge = 1024px)
-        max_size = 1024
+        max_size = 2048
         if max(h, w) > max_size:
             ratio = max_size / max(h, w)
             new_w = max(1, int(w * ratio))
@@ -160,15 +139,11 @@ class MaskCanvasEditor:
         else:
             img_pil = Image.fromarray((img_np * 255).clip(0, 255).astype(np.uint8))
 
-        # Save to ComfyUI temp folder
         filename = f"mce_bg_{unique_id}.png"
         filepath = os.path.join(folder_paths.get_temp_directory(), filename)
         img_pil.save(filepath, compress_level=1)
-        return filename
+        return filename, h, w
 
-    # ------------------------------------------------------------------
-    #  Main processing
-    # ------------------------------------------------------------------
     def process(
         self,
         mask: torch.Tensor,
@@ -176,18 +151,6 @@ class MaskCanvasEditor:
         transform_state: str = "{}",
         unique_id: str = "0",
     ):
-        """
-        Args:
-            mask:             (B, H, W) mask defining the crop region
-            image:            (B, H, W, C) background image
-            transform_state:  JSON string from the JS canvas editor
-            unique_id:        ComfyUI node ID (hidden input)
-
-        Returns:
-            cropped_image: (B, H', W', C)
-            cropped_mask:  (B, H', W')
-        """
-        # Parse transform state from JS frontend
         state = json.loads(transform_state) if transform_state else {}
         scale = float(state.get("scale", 1.0))
         rotation = float(state.get("rotation", 0.0))
@@ -196,14 +159,16 @@ class MaskCanvasEditor:
         offset_x = int(state.get("offsetX", 0))
         offset_y = int(state.get("offsetY", 0))
 
-        # Save input image preview for the frontend canvas
-        preview_filename = self._save_preview(image, unique_id)
+        preview_filename, orig_h, orig_w = self._save_preview(image, unique_id)
 
         batch_size = mask.shape[0]
         device = image.device
 
         cropped_images = []
         cropped_masks = []
+
+        # Track info from first batch item for frontend metadata
+        ui_info = {}
 
         for b in range(batch_size):
             m = mask[b]
@@ -214,6 +179,15 @@ class MaskCanvasEditor:
             y_min, y_max, x_min, x_max = self._get_bbox(m)
             bbox_h = y_max - y_min
             bbox_w = x_max - x_min
+
+            # Store bbox info from first iteration
+            if b == 0:
+                ui_info = {
+                    "orig_h": orig_h,
+                    "orig_w": orig_w,
+                    "bbox_h": bbox_h,
+                    "bbox_w": bbox_w,
+                }
 
             m_cropped = m[y_min:y_max, x_min:x_max]
 
@@ -249,6 +223,7 @@ class MaskCanvasEditor:
                     "subfolder": "",
                     "type": "temp",
                 }],
+                "mce_info": [ui_info],
             },
             "result": (
                 torch.stack(cropped_images, dim=0),

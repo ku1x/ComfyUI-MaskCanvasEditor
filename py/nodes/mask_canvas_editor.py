@@ -1,12 +1,9 @@
 """
 Mask Canvas Editor Node
-A fully graphical ComfyUI node — the node body itself is an interactive canvas editor.
-Position a background image behind a mask region with direct visual manipulation:
-drag to pan, scroll to zoom, shift+scroll to rotate, buttons to flip.
-No parameter sliders needed — everything is controlled through the canvas.
-
-The input image is saved as a preview so the frontend canvas shows the actual
-image as the background rather than a placeholder grid.
+Interactive canvas editor — position a background image behind a mask region.
+The mask is always treated as a rectangular bounding box (the mask shape is
+not used for cropping; only its bounding box defines the crop window).
+Supports drag to pan, scroll to zoom, shift+scroll to rotate, buttons to flip.
 """
 
 import torch
@@ -40,9 +37,8 @@ class MaskCanvasEditor:
     CATEGORY = "Mask/CanvasEditor"
     OUTPUT_NODE = False
     DESCRIPTION = (
-        "Interactive canvas editor — the node body is a visual canvas. "
-        "Drag to pan the background image behind the mask, scroll to zoom, "
-        "shift+scroll to rotate. No sliders needed."
+        "Interactive canvas editor. The mask defines a rectangular crop window. "
+        "Drag to pan, scroll to zoom, shift+scroll to rotate. No sliders needed."
     )
 
     @classmethod
@@ -121,11 +117,6 @@ class MaskCanvasEditor:
 
     @staticmethod
     def _save_preview(image: torch.Tensor, unique_id: str) -> tuple:
-        """
-        Save a downsampled copy of the input image to ComfyUI's temp directory.
-        Returns (filename, orig_h, orig_w) where orig_h/w are the original
-        image dimensions (pre-downscale).
-        """
         img_np = image[0].cpu().numpy()
         h, w = img_np.shape[:2]
 
@@ -152,7 +143,7 @@ class MaskCanvasEditor:
         unique_id: str = "0",
     ):
         state = json.loads(transform_state) if transform_state else {}
-        scale = float(state.get("scale", 1.0))
+        scale_val = float(state.get("scale", 1.0))
         rotation = float(state.get("rotation", 0.0))
         flip_h = bool(state.get("flipH", False))
         flip_v = bool(state.get("flipV", False))
@@ -166,8 +157,6 @@ class MaskCanvasEditor:
 
         cropped_images = []
         cropped_masks = []
-
-        # Track info from first batch item for frontend metadata
         ui_info = {}
 
         for b in range(batch_size):
@@ -180,7 +169,6 @@ class MaskCanvasEditor:
             bbox_h = y_max - y_min
             bbox_w = x_max - x_min
 
-            # Store bbox info from first iteration
             if b == 0:
                 ui_info = {
                     "orig_h": orig_h,
@@ -189,13 +177,14 @@ class MaskCanvasEditor:
                     "bbox_w": bbox_w,
                 }
 
-            m_cropped = m[y_min:y_max, x_min:x_max]
+            # ── Rectangular mask output (all 1s within bbox) ──
+            m_cropped = torch.ones((bbox_h, bbox_w), dtype=img.dtype, device=device)
 
             grid = self._build_sampling_grid(
                 bbox_h=bbox_h, bbox_w=bbox_w,
                 img_h=img_h, img_w=img_w,
                 y_min=y_min, y_max=y_max, x_min=x_min, x_max=x_max,
-                scale=scale, rotation=rotation,
+                scale=scale_val, rotation=rotation,
                 flip_h=flip_h, flip_v=flip_v,
                 offset_x=offset_x, offset_y=offset_y,
                 device=device,
@@ -210,10 +199,8 @@ class MaskCanvasEditor:
 
             sampled = sampled.squeeze(0).permute(1, 2, 0)
 
-            mask_expanded = m_cropped.unsqueeze(-1)
-            sampled_masked = sampled * mask_expanded
-
-            cropped_images.append(sampled_masked)
+            # ── No mask multiplication — full rectangular crop ──
+            cropped_images.append(sampled)
             cropped_masks.append(m_cropped)
 
         return {

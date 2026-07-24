@@ -29,27 +29,13 @@ const CANVAS_H = 600;
 //  Graph helpers
 // ─────────────────────────────────────────────────────────────
 
-/** Find the upstream node connected to a given input index. */
-function getUpstreamNode(node, inputIdx) {
+/** Find the upstream node ID connected to a given input index. */
+function getUpstreamNodeId(node, inputIdx) {
   const input = node.inputs?.[inputIdx];
   if (!input?.link) return null;
   const link = app.graph.links?.[input.link];
   if (!link) return null;
-  return app.graph.getNodeById(link.origin_id);
-}
-
-/** Try to extract a LoadImage filename from an upstream node. */
-function getImageFilename(upstream) {
-  if (!upstream) return null;
-  // LoadImage stores the current image filename in its "image" widget
-  const w = upstream.widgets?.find((x) => x.name === "image");
-  return w?.value || null;
-}
-
-/** Check if two nodes are connected (upstream → downstream at given input). */
-function isConnectedVia(upstreamType, downstream, inputIdx) {
-  const up = getUpstreamNode(downstream, inputIdx);
-  return up?.type === upstreamType;
+  return link.origin_id;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -166,97 +152,77 @@ app.registerExtension({
       img.src = url;
     };
 
-    // ── Try to load images from upstream (no queue needed) ─
+    // ── Load images via /mce/load API ────────────────────
     nodeType.prototype._loadFromUpstream = function () {
       return new Promise((resolve) => {
-        const imageUpstream = getUpstreamNode(this, 1); // image input
-        const maskUpstream = getUpstreamNode(this, 0);   // mask input
+        const imageNodeId = getUpstreamNodeId(this, 1);
+        const maskNodeId = getUpstreamNodeId(this, 0);
 
-        if (!imageUpstream) {
+        // Try to read filenames from LoadImage widgets directly (works without queue)
+        let imageFilename = null;
+        let maskFilename = null;
+        if (imageNodeId) {
+          const upNode = app.graph.getNodeById(imageNodeId);
+          if (upNode) {
+            const w = upNode.widgets?.find((x) => x.name === "image");
+            if (w) imageFilename = w.value;
+          }
+        }
+        if (maskNodeId && maskNodeId !== imageNodeId) {
+          const upNode = app.graph.getNodeById(maskNodeId);
+          if (upNode) {
+            const w = upNode.widgets?.find((x) => x.name === "image");
+            if (w) maskFilename = w.value;
+          }
+        }
+
+        if (!imageNodeId && !imageFilename) {
           resolve(false);
           return;
         }
 
-        const imageFile = getImageFilename(imageUpstream);
-        if (!imageFile) {
-          resolve(false);
-          return;
-        }
+        const params = new URLSearchParams();
+        if (imageFilename) params.set("image_filename", imageFilename);
+        if (maskFilename) params.set("mask_filename", maskFilename);
+        if (!imageFilename && imageNodeId) params.set("image_node_id", imageNodeId);
+        if (maskNodeId) params.set("mask_node_id", maskNodeId);
+        params.set("t", Date.now());
 
-        // Load background image directly from input dir
-        const imgUrl = `/view?filename=${encodeURIComponent(imageFile)}&type=input&t=${Date.now()}`;
-        const img = new Image();
-        img.onload = () => {
-          this.__mce_img = img;
-          this.__mce_imgW = img.naturalWidth;
-          this.__mce_imgH = img.naturalHeight;
-          this.__mce_origW = img.naturalWidth;
-          this.__mce_origH = img.naturalHeight;
-
-          // Try to load mask from upstream too
-          if (maskUpstream) {
-            const maskFile = getImageFilename(maskUpstream);
-            if (maskFile) {
-              // Load mask as image and compute bbox from its alpha / luminance
-              const maskImg = new Image();
-              maskImg.crossOrigin = "Anonymous";
-              maskImg.onload = () => {
-                // Render mask to canvas to find non-zero region
-                const mc = document.createElement("canvas");
-                mc.width = maskImg.naturalWidth;
-                mc.height = maskImg.naturalHeight;
-                const mctx = mc.getContext("2d");
-                mctx.drawImage(maskImg, 0, 0);
-                const md = mctx.getImageData(0, 0, mc.width, mc.height);
-                const pixels = md.data;
-                // Find bbox of non-zero alpha/luminance pixels
-                let minX = mc.width, minY = mc.height, maxX = 0, maxY = 0;
-                for (let y = 0; y < mc.height; y++) {
-                  for (let x = 0; x < mc.width; x++) {
-                    const i = (y * mc.width + x) * 4;
-                    const val = pixels[i] > 128 || pixels[i + 3] > 128;
-                    if (val) {
-                      if (x < minX) minX = x;
-                      if (x > maxX) maxX = x;
-                      if (y < minY) minY = y;
-                      if (y > maxY) maxY = y;
-                    }
-                  }
-                }
-                if (maxX > minX && maxY > minY) {
-                  this.__mce_bboxW = maxX - minX + 1;
-                  this.__mce_bboxH = maxY - minY + 1;
-                } else {
-                  // If we can't find mask content, use full image
-                  this.__mce_bboxW = img.naturalWidth;
-                  this.__mce_bboxH = img.naturalHeight;
-                }
-                this.__mce_hasQueueResult = false;
-                this.setDirtyCanvas(true, true);
-                resolve(true);
-              };
-              maskImg.onerror = () => {
-                // Fallback: use full image as bbox
-                this.__mce_bboxW = img.naturalWidth;
-                this.__mce_bboxH = img.naturalHeight;
-                this.__mce_hasQueueResult = false;
-                this.setDirtyCanvas(true, true);
-                resolve(true);
-              };
-              maskImg.src = `/view?filename=${encodeURIComponent(maskFile)}&type=input&t=${Date.now()}`;
+        fetch(`/mce/load?${params.toString()}`)
+          .then((r) => r.json())
+          .then((data) => {
+            if (!data.success) {
+              resolve(false);
               return;
             }
-          }
 
-          // No mask upstream or mask not LoadImage — use full image as bbox
-          this.__mce_bboxW = img.naturalWidth;
-          this.__mce_bboxH = img.naturalHeight;
-          this.__mce_hasQueueResult = false;
-          this.setDirtyCanvas(true, true);
-          resolve(true);
-        };
-        img.onerror = () => resolve(false);
-        img.src = imgUrl;
+            const imgInfo = data.image;
+
+            if (imgInfo && imgInfo.url) {
+              this.__mce_origW = imgInfo.width || 0;
+              this.__mce_origH = imgInfo.height || 0;
+              const mi = data.mask;
+              this.__mce_bboxW = (mi && mi.width) || imgInfo.width || 0;
+              this.__mce_bboxH = (mi && mi.height) || imgInfo.height || 0;
+
+              const img = new Image();
+              img.onload = () => {
+                this.__mce_img = img;
+                this.__mce_imgW = img.naturalWidth;
+                this.__mce_imgH = img.naturalHeight;
+                if (!this.__mce_origW) this.__mce_origW = img.naturalWidth;
+                if (!this.__mce_origH) this.__mce_origH = img.naturalHeight;
+                this.__mce_hasQueueResult = false;
+                this.setDirtyCanvas(true, true);
+                resolve(true);
+              };
+              img.onerror = () => resolve(false);
+              img.src = imgInfo.url + "&t=" + Date.now();
+            } else {
+              resolve(false);
+            }
+          })
+          .catch(() => resolve(false));
       });
     };
 

@@ -1,6 +1,7 @@
 """Custom API routes for Mask Canvas Editor."""
 
 import os
+import numpy as np
 from PIL import Image
 
 import folder_paths
@@ -35,12 +36,10 @@ def find_image_file(filename):
     if not filename:
         return None
     input_dir = folder_paths.get_input_directory()
-    # Try direct path first
     for dirpath in [input_dir]:
         full = os.path.join(dirpath, filename)
         if os.path.isfile(full):
             return full
-        # Try with subfolders
         for root, _dirs, files in os.walk(dirpath):
             if filename in files:
                 return os.path.join(root, filename)
@@ -65,20 +64,52 @@ def file_response(filename):
     }
 
 
+def compute_mask_bbox(filename):
+    """
+    Open a mask image file, find the non-zero region,
+    return {width, height} of the bounding box.
+    Returns full image dimensions if mask is all-zero.
+    """
+    full = find_image_file(filename)
+    if not full:
+        return None
+    try:
+        with Image.open(full) as img:
+            arr = np.array(img.convert("L"))
+    except Exception:
+        return None
+
+    h, w = arr.shape
+    rows = np.any(arr > 128, axis=1)
+    cols = np.any(arr > 128, axis=0)
+
+    if rows.any() and cols.any():
+        y_indices = np.where(rows)[0]
+        x_indices = np.where(cols)[0]
+        bbox_h = int(y_indices[-1] - y_indices[0] + 1)
+        bbox_w = int(x_indices[-1] - x_indices[0] + 1)
+    else:
+        bbox_w, bbox_h = w, h
+
+    return {"width": bbox_w, "height": bbox_h}
+
+
 @PromptServer.instance.routes.get("/mce/load")
 async def mce_load(request):
     """
     Load image + mask preview for MaskCanvasEditor.
 
-    Query params (pick one scheme):
-      Scheme A — from graph (needs prior queue):
-        image_node_id, mask_node_id
-
-      Scheme B — from widget values (works without queue):
-        image_filename, mask_filename
+    Query params:
+      image_filename    - LoadImage widget value (works without queue)
+      mask_filename     - LoadImage widget value for mask
+      image_node_id     - fallback: node ID from prompt cache
+      mask_node_id      - fallback: node ID from prompt cache
 
     Returns:
-      { success: true, image: {url, width, height}, mask: {url, width, height} }
+      { success: true, image: {url, width, height},
+        mask: {url, width, height} }
+      mask.width / mask.height are the ACTUAL bbox of non-zero mask pixels,
+      not the full mask image frame dimensions.
     """
     try:
         image_node_id = request.query.get("image_node_id", "")
@@ -89,13 +120,18 @@ async def mce_load(request):
         img_result = None
         mask_result = None
 
-        # ── Scheme B (direct filename, highest priority) ──
+        # ── Direct filenames from LoadImage widgets ──
         if image_filename:
             img_result = file_response(image_filename)
+
         if mask_filename:
             mask_result = file_response(mask_filename)
+            mask_bbox = compute_mask_bbox(mask_filename)
+            if mask_bbox and mask_result:
+                mask_result["width"] = mask_bbox["width"]
+                mask_result["height"] = mask_bbox["height"]
 
-        # ── Scheme A (from prompt cache, fallback) ──
+        # ── Fallback: prompt cache (needs prior queue) ──
         if not img_result and image_node_id:
             info = get_node_from_prompt(image_node_id)
             if info:
@@ -108,15 +144,18 @@ async def mce_load(request):
             fname = None
             if info:
                 fname = resolve_input_filename(info, "image")
-            # If mask node = image node, try same file
             if not fname and image_node_id and mask_node_id == image_node_id:
                 info = get_node_from_prompt(image_node_id)
                 if info:
                     fname = resolve_input_filename(info, "image")
             if fname:
                 mask_result = file_response(fname)
+                mask_bbox = compute_mask_bbox(fname)
+                if mask_bbox and mask_result:
+                    mask_result["width"] = mask_bbox["width"]
+                    mask_result["height"] = mask_bbox["height"]
 
-        # If we only found an image but no mask, derive mask from image
+        # No separate mask — use image full frame as mask
         if img_result and not mask_result:
             mask_result = {
                 "url": img_result["url"],
@@ -134,8 +173,7 @@ async def mce_load(request):
             return web.json_response({
                 "success": False,
                 "error": "Cannot find upstream image. "
-                         "Try connecting a LoadImage node directly, "
-                         "or queue the workflow once.",
+                         "Connect a LoadImage directly or queue once.",
             })
 
     except Exception as e:
